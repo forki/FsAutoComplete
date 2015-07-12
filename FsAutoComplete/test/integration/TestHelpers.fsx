@@ -64,6 +64,7 @@ type FsAutoCompleteWrapper() =
     s + t
 
 let formatJson json =
+    printfn "formatJson called on '%s'" json
     let parsedJson = JsonConvert.DeserializeObject(json)
     JsonConvert.SerializeObject(parsedJson, Formatting.Indented)
 
