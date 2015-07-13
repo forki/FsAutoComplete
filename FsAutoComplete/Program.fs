@@ -425,10 +425,11 @@ module internal Main =
         //       unless the user reparses. If they fail, still store the state of the file? In
         //       any case, allow a long timeout on that operation.
         let text, projFile, args = getoptions file state'
-
+        //let options = agent.GetScriptCheckerOptions(file, projFile, text)
+        
         let task =
           async {
-            let! results = agent.ParseAndCheckFileInProject(projFile, file, text, [||], args, true)
+            let! results = agent.ParseAndCheckFileInProject(projFile, file, text, [||], args)
             match results.GetErrors() with
             | None -> ()
             | Some errs ->

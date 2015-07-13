@@ -200,7 +200,22 @@ type LanguageService(dirtyNotify) =
   /// Load times used to reset type checking properly on script/project load/unload. It just has to be unique for each project load/reload.
   /// Not yet sure if this works for scripts.
   let fakeDateTimeRepresentingTimeLoaded proj = DateTime(abs (int64 (match proj with null -> 0 | _ -> proj.GetHashCode())) % 103231L)
-
+  
+  let withTimeout (timeOut: option<int>) (operation: Async<'x>) : Async<option<'x>> =
+    match timeOut with
+     | None -> async {
+         let! result = operation
+         return Some result
+       }
+     | Some timeOut -> async {
+         let! child = Async.StartChild (operation, timeOut)
+         try
+           let! result = child
+           return Some result
+         with :? System.TimeoutException ->
+           return None
+       }
+     
   // Create an instance of interactive checker. The callback is called by the F# compiler service
   // when its view of the prior-typechecking-state of the start of a file has changed, for example
   // when the background typechecker has "caught up" after some other file has been changed, 
@@ -209,69 +224,6 @@ type LanguageService(dirtyNotify) =
     let checker = FSharpChecker.Create()
     checker.BeforeBackgroundFileCheck.Add dirtyNotify
     checker
-
-  /// When creating new script file on Mac, the filename we get sometimes 
-  /// has a name //foo.fsx, and as a result 'Path.GetFullPath' throws in the F#
-  /// language service - this fixes the issue by inventing nicer file name.
-  let fixFileName path = 
-    if (try Path.GetFullPath(path) |> ignore; true
-        with _ -> false) then path
-    else 
-      let dir = 
-        if Environment.OSVersion.Platform = PlatformID.Unix ||  
-           Environment.OSVersion.Platform = PlatformID.MacOSX then
-          Environment.GetEnvironmentVariable("HOME") 
-        else
-          Environment.ExpandEnvironmentVariables("%HOMEDRIVE%%HOMEPATH%")
-      Path.Combine(dir, Path.GetFileName(path))
-   
-  // We use a mailbox processor to wrap requests to F.C.S. here so 
-  //   (a) we can get work off the GUI thread and 
-  //   (b) timeout on synchronous requests. 
-  // 
-  // There is already a background compilation queue+thread in F.C.S. abd many of the F.C.S. operations
-  // are already asynchronous. However using direct calls to the F.C.S. API isn't quite sufficient because
-  // we can't timeout, and not all F.C.S. operations are asynchronous (e.g. parsing). If F.C.S. is extended
-  // so all operations are asynchronous then I believe we won't need a wrapper agent at all.
-  //
-  // Every request to this agent is 'PostAndReply' or 'PostAndAsyncReply'.  This means the requests are
-  // a lot like a function call, except 
-  //   (a) they may be asynchronous (reply is interleaved on the UI thread)
-  //   (b) they may be on on a timeout (to prevent blocking the UI thread)
-  //   (c) only one request is active at a time, the rest are in the queue
-
-  let mbox = MailboxProcessor.Start(fun mbox ->
-    
-    async { 
-       while true do
-            try
-              Debug.WriteLine("LanguageService agent: Awaiting request") 
-              let! (fileName, source, options, reply: AsyncReplyChannel<_> ) = mbox.Receive()
-
-              Debug.WriteLine("LanguageService agent: Dequeued request {0} remaining", mbox.CurrentQueueLength) 
-              let fileName = fixFileName(fileName)
-
-              Debug.WriteLine("LanguageService agent: start parsing - {0}", box fileName)
-              let! parseResults = checker.ParseFileInProject(fileName, source, options)
-              Debug.WriteLine("LanguageService agent: parse completed")
-
-              Debug.WriteLine("LanguageService agent: Typecheck source...")
-              let! checkAnswer = checker.CheckFileInProject(parseResults, fileName, 0, source,options, IsResultObsolete(fun () -> false), null )
-              Debug.WriteLine(sprintf "LanguageService agent: Typecheck completed")
-              
-              // Construct new typed parse result if the task succeeded
-              let results =
-                match checkAnswer with
-                | FSharpCheckFileAnswer.Succeeded(checkResults) ->
-                    Debug.WriteLine(sprintf "LanguageService agent: Update typed info - HasFullTypeCheckInfo? %b" checkResults.HasFullTypeCheckInfo)
-                    ParseAndCheckResults(checkResults, parseResults)
-                | _ -> 
-                    Debug.WriteLine("LanguageService agent: Update typed info - failed")
-                    ParseAndCheckResults.Empty
-                    
-              reply.Reply results
-            with exn -> Debug.WriteLine( sprintf "LanguageService agent: Exception: %s" (exn.ToString()) )
-        })
 
   static member IsAScript fileName =
       let ext = Path.GetExtension fileName
@@ -294,7 +246,6 @@ type LanguageService(dirtyNotify) =
     let opts = 
         // We are in a stand-alone file or we are in a project, but currently editing a script file
         try 
-          let fileName = fixFileName(fileName)
           Debug.WriteLine (sprintf "LanguageService: GetScriptCheckerOptions: Creating for stand-alone file or script: '%s'" fileName )
           let opts =
               Async.RunSynchronously (checker.GetProjectOptionsFromScript(fileName, source, fakeDateTimeRepresentingTimeLoaded projFilename),
@@ -341,37 +292,40 @@ type LanguageService(dirtyNotify) =
     //                      opts.ProjectFileName opts.ProjectFileNames opts.ProjectOptions opts.IsIncompleteTypeCheckEnvironment opts.UseScriptResolutionRules)
     opts
     
-  
+  member x.Robin(fileName, src, opts) =
+    async {
+      let! parseResults = checker.ParseFileInProject(fileName, src, opts)
+      let! checkAnswer = checker.CheckFileInProject(parseResults, fileName, 0, src, opts, IsResultObsolete(fun () -> false), null)
+      let results =
+        match checkAnswer with
+        | FSharpCheckFileAnswer.Succeeded(checkResults) -> ParseAndCheckResults(checkResults, parseResults)
+        | _ -> ParseAndCheckResults.Empty
+      return results
+      }
+    
   /// Parses and checks the given file in the given project under the given configuration. Asynchronously
   /// returns the results of checking the file.
-  member x.ParseAndCheckFileInProject(projectFilename, fileName:string, src, files, args, storeAst, ?startBgCompile) =
+  member x.ParseAndCheckFileInProject(projectFilename, fileName:string, src, files, args, ?startBgCompile) =
    let startBgCompile = defaultArg startBgCompile true
 
    async {
-    let opts = x.GetCheckerOptions(fileName, projectFilename,  src, files , args)
-    Debug.WriteLine(sprintf "LanguageService: ParseAndCheckFileInProject: Trigger parse (fileName=%s)" fileName)
+    let opts = x.GetCheckerOptions(fileName, projectFilename, src, files , args)
 
-    // storeAst is passed from monodevelop when it finds files with the same name in other projects. 
-    // It will then ask for a reparse of all files in the second project. If storeAst = false, do nothing. 
-    if not storeAst then return ParseAndCheckResults.Empty else
-    let! results = mbox.PostAndAsyncReply(fun r -> fileName, src, opts, r)
-    if startBgCompile then
-        Debug.WriteLine(sprintf "LanguageService: Starting background compilations")
-        checker.StartBackgroundCompile(opts)
-    return results
+    if startBgCompile then checker.StartBackgroundCompile(opts)
+    return! x.Robin(fileName, src, opts)
    }
 
   member x.ParseFileInProject(projectFilename, fileName:string, src, args) = 
     let opts = x.GetCheckerOptions(fileName, projectFilename, src, [| |], args)
     Debug.WriteLine(sprintf "LanguageService: ParseFileInProject: Get untyped parse result (fileName=%s)" fileName)
-    checker.ParseFileInProject(fixFileName fileName, src, opts)
+    checker.ParseFileInProject(fileName, src, opts)
 
   member internal x.TryGetStaleTypedParseResult(fileName:string, options, src, stale)  = 
     // Try to get recent results from the F# service
     let res = 
         match stale with 
-        | AllowStaleResults.MatchingFileName -> checker.TryGetRecentTypeCheckResultsForFile(fixFileName fileName, options) 
-        | AllowStaleResults.MatchingSource -> checker.TryGetRecentTypeCheckResultsForFile(fixFileName fileName, options, source=src) 
+        | AllowStaleResults.MatchingFileName -> checker.TryGetRecentTypeCheckResultsForFile(fileName, options) 
+        | AllowStaleResults.MatchingSource -> checker.TryGetRecentTypeCheckResultsForFile(fileName, options, source=src) 
         | AllowStaleResults.No -> None
     match res with 
     | Some (untyped,typed,_) when typed.HasFullTypeCheckInfo  -> Some (ParseAndCheckResults(typed, untyped))
@@ -390,9 +344,7 @@ type LanguageService(dirtyNotify) =
     | None -> 
         Debug.WriteLine(sprintf "LanguageService: Not using stale results - trying typecheck with timeout")
         // If we didn't get a recent set of type checking results, we put in a request and wait for at most 'timeout' for a response
-        match timeout with
-        | Some timeout -> return mbox.TryPostAndReply((fun reply -> (fileName, src, opts, reply)), timeout = timeout)
-        | None -> return mbox.TryPostAndReply((fun reply -> (fileName, src, opts, reply)))
+        return! withTimeout timeout (x.Robin(fileName, src, opts))
    }
 
   member x.GetTypedParseResultIfAvailable(projectFilename, fileName:string, src, files, args, stale) = 
