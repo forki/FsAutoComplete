@@ -421,6 +421,9 @@ module internal Main =
         let state' =  { state with Files = state.Files |> Map.add file
                                                         { Lines = lines
                                                           Touched = DateTime.Now } }
+        // TODO: Get the script checker options here, and store them for later. We can reuse
+        //       unless the user reparses. If they fail, still store the state of the file? In
+        //       any case, allow a long timeout on that operation.
         let text, projFile, args = getoptions file state'
 
         let task =
