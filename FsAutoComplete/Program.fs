@@ -20,21 +20,6 @@ type OutputMode =
   | Json
   | Text
 
-/// Represents information needed to call the F# IntelliSense service
-/// (including project/script options, file name and source)
-type internal RequestOptions(opts, file, src) =
-  member x.Options : FSharpProjectOptions = opts
-  member x.FileName : string = file
-  member x.Source : string = src
-  member x.WithSource(source) =
-    RequestOptions(opts, file, source)
-
-  override x.ToString() =
-    sprintf "FileName: '%s'\nSource length: '%d'\nOptions: %s, %A, %A, %b, %b"
-      x.FileName x.Source.Length x.Options.ProjectFileName x.Options.ProjectFileNames
-      x.Options.OtherOptions x.Options.IsIncompleteTypeCheckEnvironment
-      x.Options.UseScriptResolutionRules
-
 type ResponseMsg<'T> =
   {
     Kind: string
@@ -337,7 +322,8 @@ module internal CompletionUtils =
 type internal State =
   {
     Files : Map<string,VolatileFile> //filename -> lines * touch date
-    Projects : Map<string, FSharpProjectFileInfo>
+    Projects : Map<string, FSharpProjectOptions>
+    Scripts : Map<string, FSharpProjectOptions>
     HelpText : Map<String, FSharpToolTipText>
   }
 
@@ -360,7 +346,10 @@ module internal Main =
 
    member x.Quit() = agent.PostAndReply(fun ch -> Choice2Of2 ch)
 
-  let initialState = { Files = Map.empty; Projects = Map.empty; HelpText = Map.empty }
+  let initialState = { Files = Map.empty
+                       Projects = Map.empty
+                       Scripts = Map.empty
+                       HelpText = Map.empty }
 
   let printAgent = new PrintingAgent()
 
@@ -399,37 +388,48 @@ module internal Main =
       if not ok then printMsg "error" "Position is out of range"
       ok
 
-    let getoptions file state =
-      let text = String.concat "\n" state.Files.[file].Lines
-      let project = Map.tryFind file state.Projects
-      let projFile, args =
-          match project with
-          | None -> file, [|file|]
-          | Some p -> p.Directory + "/Project.fsproj", Array.ofList p.Options
-      text, projFile, args
+    let getRequestOptions file state : RequestOptions =
+      let optionsOpt =
+        if LanguageService.IsAScript file then
+          Map.tryFind file state.Scripts
+        else
+          Map.tryFind file state.Projects
 
-    // Debug.print "main state is:\nproject: %b\nfiles: %A\nmode: %A"
-    //             (Option.isSome state.Project)
-    //             (Map.fold (fun ks k _ -> k::ks) [] state.Files)
-    //             state.OutputMode
+      match optionsOpt with
+      | Some x -> RequestOptions(x, file, String.concat "\n" state.Files.[file].Lines)
+      | None ->
+
+      RequestOptions(
+          { ProjectFileName = file + ".fsproj"
+            ProjectFileNames = [|file|]
+            OtherOptions = [|"--noframework"|]
+            ReferencedProjects = [| |]
+            IsIncompleteTypeCheckEnvironment = true
+            UseScriptResolutionRules = false   
+            LoadTime = LanguageService.fakeDateTimeRepresentingTimeLoaded file
+            UnresolvedReferences = None },
+          file,
+          String.concat "\n" state.Files.[file].Lines)
+
     match parseCommand(Console.ReadLine()) with
-
     | Parse(file,kind) ->
         // Trigger parse request for a particular file
         let lines = readInput [] |> Array.ofList
         let file = Path.GetFullPath file
-        let state' =  { state with Files = state.Files |> Map.add file
-                                                        { Lines = lines
-                                                          Touched = DateTime.Now } }
-        // TODO: Get the script checker options here, and store them for later. We can reuse
-        //       unless the user reparses. If they fail, still store the state of the file? In
-        //       any case, allow a long timeout on that operation.
-        let text, projFile, args = getoptions file state'
-        //let options = agent.GetScriptCheckerOptions(file, projFile, text)
+
+        let text = String.concat "\n" lines
+
+        let options =
+          if LanguageService.IsAScript file then
+            RequestOptions(agent.GetScriptCheckerOptions(file, text),
+                           file,
+                           text)
+          else
+            getRequestOptions file state
         
         let task =
           async {
-            let! results = agent.ParseAndCheckFileInProject(projFile, file, text, [||], args)
+            let! results = agent.ParseAndCheckFileInProject(options)
             match results.GetErrors() with
             | None -> ()
             | Some errs ->
@@ -442,8 +442,11 @@ module internal Main =
         | Normal -> printMsg "info" "Background parsing started"
                     Async.StartImmediate task
 
-
-        main state'
+        let state = { state with Files = state.Files |> Map.add file
+                                                        { Lines = lines
+                                                          Touched = DateTime.Now }
+                                 Scripts = state.Scripts |> Map.add file options.Options }
+        main state
 
     | Project file ->
         // Load project file and store in state
@@ -463,9 +466,18 @@ module internal Main =
                                 Output = targetFilename
                                 References = List.sortBy Path.GetFileName p.References
                                 Framework = framework } }
+            let loadedTimeStamp = LanguageService.fakeDateTimeRepresentingTimeLoaded file
+            let projectOptions = agent.GetChecker().GetProjectOptionsFromCommandLineArgs(file, Array.ofList p.Options, loadedTimeStamp=loadedTimeStamp)
+            let referencedProjectOptions =
+              [| for file in p.ProjectReferences do
+                     if Path.GetExtension(file) = ".fsproj" then
+                         yield file, agent.GetChecker().GetProjectOptionsFromProjectFile(file, loadedTimeStamp=loadedTimeStamp) |]
+
+            let po = { projectOptions
+                       with ReferencedProjects = referencedProjectOptions }
             let projects =
               files
-              |> List.fold (fun s f -> Map.add f p s) state.Projects
+              |> List.fold (fun s f -> Map.add f po s) state.Projects
             main { state with Projects = projects }
           with e ->
             printMsg "error" (sprintf "Project file '%s' is invalid: '%s'" file e.Message)
@@ -477,8 +489,10 @@ module internal Main =
     | Declarations file ->
         let file = Path.GetFullPath file
         if parsed file then
-          let text, projFile, args = getoptions file state
-          let parseResult = agent.ParseFileInProject(projFile, file, text, args) |> Async.RunSynchronously
+          let options = getRequestOptions file state
+          let parseResult =
+            agent.GetChecker().ParseFileInProject(options.FileName, options.Source, options.Options)
+            |> Async.RunSynchronously
           let decls = parseResult.GetNavigationItems().Declarations
           prAsJson { Kind = "declarations"; Data = decls }
         main state
@@ -498,11 +512,13 @@ module internal Main =
     | PosCommand(cmd, file, line, col, timeout, filter) ->
         let file = Path.GetFullPath file
         if parsed file && posok file line col then
-          let text, projFile, args = getoptions file state
+          let options = getRequestOptions file state
           let lineStr = state.Files.[file].Lines.[line - 1]
           // TODO: Deny recent typecheck results under some circumstances (after bracketed expr..)
           let timeout = match timeout with Some x -> x | _ -> 20000
-          let tyResOpt = agent.GetTypedParseResultWithTimeout(projFile, file, text, [||], args, AllowStaleResults.MatchingFileName, timeout)
+          let tyResOpt = agent.GetTypedParseResultWithTimeout(options,
+                                                              AllowStaleResults.MatchingFileName,
+                                                              timeout)
                          |> Async.RunSynchronously
           match tyResOpt with
           | None -> printMsg "error" "Timeout when fetching typed parse result"; main state
