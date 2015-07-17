@@ -322,8 +322,7 @@ module internal CompletionUtils =
 type internal State =
   {
     Files : Map<string,VolatileFile> //filename -> lines * touch date
-    Projects : Map<string, FSharpProjectOptions>
-    Scripts : Map<string, FSharpProjectOptions>
+    FileCheckOptions : Map<string, FSharpProjectOptions>
     HelpText : Map<String, FSharpToolTipText>
   }
 
@@ -347,8 +346,7 @@ module internal Main =
    member x.Quit() = agent.PostAndReply(fun ch -> Choice2Of2 ch)
 
   let initialState = { Files = Map.empty
-                       Projects = Map.empty
-                       Scripts = Map.empty
+                       FileCheckOptions = Map.empty
                        HelpText = Map.empty }
 
   let printAgent = new PrintingAgent()
@@ -389,14 +387,11 @@ module internal Main =
       ok
 
     let getRequestOptions file state : RequestOptions =
-      let optionsOpt =
-        if LanguageService.IsAScript file then
-          Map.tryFind file state.Scripts
-        else
-          Map.tryFind file state.Projects
-
-      match optionsOpt with
-      | Some x -> RequestOptions(x, file, String.concat "\n" state.Files.[file].Lines)
+      match Map.tryFind file state.FileCheckOptions with
+      | Some x ->
+          let text = String.concat "\n" state.Files.[file].Lines
+          RequestOptions(x, file, text)
+        
       | None ->
 
       RequestOptions(
@@ -410,7 +405,8 @@ module internal Main =
             UnresolvedReferences = None },
           file,
           String.concat "\n" state.Files.[file].Lines)
-
+      
+    //Debug.print "main state is:\n %A\n%A"  (Map.toList state.Files)  (Map.toList state.Projects)
     match parseCommand(Console.ReadLine()) with
     | Parse(file,kind) ->
         // Trigger parse request for a particular file
@@ -418,7 +414,10 @@ module internal Main =
         let file = Path.GetFullPath file
 
         let text = String.concat "\n" lines
-
+        let state =
+          { state with Files = state.Files |> Map.add file
+                                                      { Lines = lines
+                                                        Touched = DateTime.Now } }
         let options =
           if LanguageService.IsAScript file then
             RequestOptions(agent.GetScriptCheckerOptions(file, text),
@@ -433,7 +432,8 @@ module internal Main =
             match results.GetErrors() with
             | None -> ()
             | Some errs ->
-              prAsJson { Kind = "errors"; Data = Seq.map FSharpErrorInfo.OfFSharpError errs }
+                prAsJson { Kind = "errors"
+                           Data = Seq.map FSharpErrorInfo.OfFSharpError errs }
           }
 
         match kind with
@@ -442,10 +442,8 @@ module internal Main =
         | Normal -> printMsg "info" "Background parsing started"
                     Async.StartImmediate task
 
-        let state = { state with Files = state.Files |> Map.add file
-                                                        { Lines = lines
-                                                          Touched = DateTime.Now }
-                                 Scripts = state.Scripts |> Map.add file options.Options }
+        let state = { state with FileCheckOptions = state.FileCheckOptions
+                                                    |> Map.add file options.Options }
         main state
 
     | Project file ->
@@ -460,27 +458,27 @@ module internal Main =
             // TODO: Handle these options more gracefully
             let targetFilename = match p.OutputFile with Some p -> p | None -> "Unknown"
             let framework = match p.FrameworkVersion with Some p -> p | None -> "Unknown"
-            prAsJson { Kind = "project"
-                       Data = { Project = file
-                                Files = files
-                                Output = targetFilename
-                                References = List.sortBy Path.GetFileName p.References
-                                Framework = framework } }
             let loadedTimeStamp = LanguageService.fakeDateTimeRepresentingTimeLoaded file
             let projectOptions = agent.GetChecker().GetProjectOptionsFromCommandLineArgs(file, Array.ofList p.Options, loadedTimeStamp=loadedTimeStamp)
             let referencedProjectOptions =
               [| for file in p.ProjectReferences do
                      if Path.GetExtension(file) = ".fsproj" then
                          yield file, agent.GetChecker().GetProjectOptionsFromProjectFile(file, loadedTimeStamp=loadedTimeStamp) |]
-
+                   
+            prAsJson { Kind = "project"
+                       Data = { Project = file
+                                Files = files
+                                Output = targetFilename
+                                References = List.sortBy Path.GetFileName p.References
+                                Framework = framework } }
             let po = { projectOptions
                        with ReferencedProjects = referencedProjectOptions }
             let projects =
               files
-              |> List.fold (fun s f -> Map.add f po s) state.Projects
-            main { state with Projects = projects }
+              |> List.fold (fun s f -> Map.add f po s) state.FileCheckOptions
+            main { state with FileCheckOptions = projects }
           with e ->
-            printMsg "error" (sprintf "Project file '%s' is invalid: '%s'" file e.Message)
+            printMsg "error" (sprintf "Project file '%s' is invalid: '%s'" file e.StackTrace)
             main state
         else
           printMsg "error" (sprintf "File '%s' does not exist" file)
