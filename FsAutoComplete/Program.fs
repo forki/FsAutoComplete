@@ -1,276 +1,16 @@
 // --------------------------------------------------------------------------------------
 // (c) Tomas Petricek, http://tomasp.net/blog
 // --------------------------------------------------------------------------------------
-namespace FSharp.InteractiveAutocomplete
+namespace FsAutoComplete
 
 open System
 open System.IO
 
 open Microsoft.FSharp.Compiler
 open Microsoft.FSharp.Compiler.SourceCodeServices
-open FSharp.CompilerBinding
 
 open Newtonsoft.Json
 open Newtonsoft.Json.Converters
-
-module FsParser = Microsoft.FSharp.Compiler.Parser
-
-/// The possible types of output
-type OutputMode =
-  | Json
-  | Text
-
-type ResponseMsg<'T> =
-  {
-    Kind: string
-    Data: 'T
-  }
-
-type Location =
-  {
-    File: string
-    Line: int
-    Column: int
-  }
-
-type CompletionResponse =
-  {
-    Name: string
-    Glyph: string
-    GlyphChar: string
-  }
-
-type ProjectResponse =
-  {
-    Project: string
-    Files: List<string>
-    Output: string
-    References: List<string>
-    Framework: string
-  }
-
-type OverloadParameter =
-  {
-    Name : string
-    CanonicalTypeTextForSorting : string
-    Display : string
-    Description : string
-  }
-type Overload =
-  {
-    Tip : string
-    TypeText : string
-    Parameters : OverloadParameter list
-    IsStaticArguments : bool
-  }
-type MethodResponse =
-  {
-    Name : string
-    CurrentParameter : int
-    Overloads : Overload list
-  }
-
-type SymbolUseRange =
-  {
-    Filename: string
-    StartLine: int
-    StartColumn: int
-    EndLine: int
-    EndColumn: int
-    IsFromDefinition: bool
-    IsFromAttribute : bool
-    IsFromComputationExpression : bool
-    IsFromDispatchSlotImplementation : bool
-    IsFromPattern : bool
-    IsFromType : bool
-  }
-
-type SymbolUseResponse =
-  {
-    Name: string
-    Uses: SymbolUseRange list
-  }
-
-type FSharpErrorInfo =
-  {
-    FileName: string
-    StartLine:int
-    EndLine:int
-    StartColumn:int
-    EndColumn:int
-    Severity:FSharpErrorSeverity
-    Message:string
-    Subcategory:string
-  }
-  static member OfFSharpError(e:Microsoft.FSharp.Compiler.FSharpErrorInfo) =
-    {
-      FileName = e.FileName
-      StartLine = e.StartLineAlternate
-      EndLine = e.EndLineAlternate
-      StartColumn = e.StartColumn + 1
-      EndColumn = e.EndColumn + 1
-      Severity = e.Severity
-      Message = e.Message
-      Subcategory = e.Subcategory
-    }
-
-type FSharpErrorSeverityConverter() =
-  inherit JsonConverter()
-
-  override x.CanConvert(t:System.Type) = t = typeof<FSharpErrorSeverity>
-
-  override x.WriteJson(writer, value, serializer) =
-    match value :?> FSharpErrorSeverity with
-    | FSharpErrorSeverity.Error -> serializer.Serialize(writer, "Error")
-    | FSharpErrorSeverity.Warning -> serializer.Serialize(writer, "Warning")
-
-  override x.ReadJson(_reader, _t, _, _serializer) =
-    raise (System.NotSupportedException())
-
-  override x.CanRead = false
-  override x.CanWrite = true
-
-type RangeConverter() =
-  inherit JsonConverter()
-
-  override x.CanConvert(t:System.Type) = t = typeof<Range.range>
-
-  override x.WriteJson(writer, value, _serializer) =
-    let range = value :?> Range.range
-    writer.WriteStartObject()
-    writer.WritePropertyName("StartColumn")
-    writer.WriteValue(range.StartColumn + 1)
-    writer.WritePropertyName("StartLine")
-    writer.WriteValue(range.StartLine)
-    writer.WritePropertyName("EndColumn")
-    writer.WriteValue(range.EndColumn + 1)
-    writer.WritePropertyName("EndLine")
-    writer.WriteValue(range.EndLine)
-    writer.WriteEndObject()
-
-  override x.ReadJson(_reader, _t, _, _serializer) =
-    raise (System.NotSupportedException())
-
-  override x.CanRead = false
-  override x.CanWrite = true
-
-// --------------------------------------------------------------------------------------
-// Utilities for parsing & processing command line input
-// --------------------------------------------------------------------------------------
-
-module internal CommandInput =
-  open Parser
-
-  // The types of commands that need position information
-  type PosCommand =
-    | Completion
-    | Methods
-    | SymbolUse
-    | ToolTip
-    | FindDeclaration
-
-  type ParseKind =
-    | Normal
-    | Synchronous
-
-  // Command that can be entered on the command-line
-  type Command =
-    | PosCommand of PosCommand * string * int * int * int option * string option
-    | HelpText of string
-    | Declarations of string
-    | Parse of string * ParseKind
-    | Error of string
-    | Project of string
-    | CompilerLocation
-    | Quit
-
-  /// Parse 'quit' command
-  let quit = string "quit" |> Parser.map (fun _ -> Quit)
-
-  /// Parse 'declarations' command
-  let declarations = parser {
-    let! _ = string "declarations "
-    let! _ = char '"'
-    let! filename = some (sat ((<>) '"')) |> Parser.map String.ofSeq
-    let! _ = char '"'
-    return Declarations(filename) }
-
-  /// Parse 'project' command
-  let project = parser {
-    let! _ = string "project "
-    let! _ = char '"'
-    let! filename = some (sat ((<>) '"')) |> Parser.map String.ofSeq
-    let! _ = char '"'
-    return Project(filename) }
-
-  /// Read multi-line input as a list of strings
-  let rec readInput input =
-    let str = Console.ReadLine()
-    if str = "<<EOF>>" then List.rev input
-    else readInput (str::input)
-
-  // Parse 'parse "<filename>" [full]' command
-  let parse = parser {
-    let! _ = string "parse "
-    let! _ = char '"'
-    let! filename = some (sat ((<>) '"')) |> Parser.map String.ofSeq
-    let! _ = char '"'
-    let! _ = many (string " ")
-    let! full = (parser { let! _ = string "sync"
-                          return Synchronous }) <|>
-                (parser { return Normal })
-    return Parse (filename, full) }
-
-  // Parse 'completion "<filename>" <line> <col> [timeout]' command
-  let completionTipOrDecl = parser {
-    let! f = (string "completion " |> Parser.map (fun _ -> Completion)) <|>
-             (string "symboluse " |> Parser.map (fun _ -> SymbolUse)) <|>
-             (string "tooltip " |> Parser.map (fun _ -> ToolTip)) <|>
-             (string "methods " |> Parser.map (fun _ -> Methods)) <|>
-             (string "finddecl " |> Parser.map (fun _ -> FindDeclaration))
-    let! _ = char '"'
-    let! filename = some (sat ((<>) '"')) |> Parser.map String.ofSeq
-    let! _ = char '"'
-    let! _ = many (string " ")
-    let! line = some digit |> Parser.map (String.ofSeq >> int)
-    let! _ = many (string " ")
-    let! col = some digit |> Parser.map (String.ofSeq >> int)
-    let! timeout =
-      (parser { let! _ = some (string " ")
-                return! some digit |> Parser.map (String.ofSeq >> int >> Some) }) <|>
-      (parser { return None })
-    let! filter =
-      (parser { let! _ = many (string " ")
-                let! _ = string "filter="
-                let! b = (string "StartsWith" <|> string "Contains")
-                         |> Parser.map String.ofSeq
-                return Some b }) <|>
-      (parser { return None })
-    return PosCommand(f, filename, line, col, timeout, filter) }
-
-  let helptext = parser {
-      let! _ = string "helptext"
-      let! _ = some (string " ")
-      let! sym = many (sat (fun _ -> true)) |> Parser.map String.ofSeq
-      return HelpText sym
-    }
-
-  let compilerlocation = parser {
-    let! _ = string "compilerlocation"
-    return CompilerLocation
-    }
-
-  // Parses always and returns default error message
-  let error = parser { return Error("Unknown command or wrong arguments") }
-
-  // Parse any of the supported commands
-  let parseCommand =
-    function
-    | null -> Quit
-    | input ->
-      let reader = Parsing.createForwardStringReader input 0
-      let cmds = compilerlocation <|> helptext <|> declarations <|> parse <|> project <|> completionTipOrDecl <|> quit <|> error
-      reader |> Parsing.getFirst cmds
 
 module internal CompletionUtils =
   let map =
@@ -326,54 +66,33 @@ type internal State =
     HelpText : Map<String, FSharpToolTipText>
   }
 
+  static member Initial =
+    { Files = Map.empty
+      FileCheckOptions = Map.empty
+      HelpText = Map.empty }
+
 /// Contains main loop of the application
 module internal Main =
-  open CommandInput
+  open FsAutoComplete.CommandInput
+  open FsAutoComplete.ResponseOutput
+  type RequestOptions = CompilerServiceInterface.RequestOptions
 
-  type internal PrintingAgent() =
-   let agent = MailboxProcessor.Start(fun agent ->
-     let rec loop () = async {
-         let! (msg: Choice<string,AsyncReplyChannel<unit>>) = agent.Receive()
-         match msg with
-         | Choice1Of2 (s: string) -> Console.WriteLine s; return! loop ()
-         | Choice2Of2 ch -> ch.Reply ()
-       }
-     loop ()
-     )
+  let respond = new PrintingAgent()
 
-   member x.WriteLine(s) = agent.Post (Choice1Of2 s)
-
-   member x.Quit() = agent.PostAndReply(fun ch -> Choice2Of2 ch)
-
-  let initialState = { Files = Map.empty
-                       FileCheckOptions = Map.empty
-                       HelpText = Map.empty }
-
-  let printAgent = new PrintingAgent()
-
-  let jsonConverters =
-    [|
-     new FSharpErrorSeverityConverter() :> JsonConverter;
-     new RangeConverter() :> JsonConverter
-    |]
-
-  let prAsJson o = printAgent.WriteLine (JsonConvert.SerializeObject(o, jsonConverters))
-  let printMsg ty s = prAsJson { Kind = ty; Data = s }
-
-  // Main agent that handles IntelliSense requests
-  let agent = new FSharp.CompilerBinding.LanguageService(fun _ -> ())
+  let checker = FSharpChecker.Instance
+  do checker.BeforeBackgroundFileCheck.Add (fun _ -> ())
 
   let mutable currentFiles = Map.empty
-  let originalFs = Microsoft.FSharp.Compiler.AbstractIL.Internal.Library.Shim.FileSystem
+  let originalFs = AbstractIL.Internal.Library.Shim.FileSystem
   let fs = new FileSystem(originalFs, fun () -> currentFiles)
-  Microsoft.FSharp.Compiler.AbstractIL.Internal.Library.Shim.FileSystem <- fs
+  AbstractIL.Internal.Library.Shim.FileSystem <- fs
 
   let rec main (state:State) : int =
     currentFiles <- state.Files
 
     let parsed file =
       let ok = Map.containsKey file state.Files
-      if not ok then printMsg "error" (sprintf "File '%s' not parsed" file)
+      if not ok then respond.Error (sprintf "File '%s' not parsed" file)
       ok
 
     /// Is the specified position consistent with internal state of file?
@@ -383,7 +102,7 @@ module internal Main =
       let lines = state.Files.[file].Lines
       let ok = line <= lines.Length && line >= 1 &&
                col <= lines.[line - 1].Length + 1 && col >= 1
-      if not ok then printMsg "error" "Position is out of range"
+      if not ok then respond.Error "Position is out of range"
       ok
 
     let getRequestOptions file state : RequestOptions =
@@ -401,15 +120,14 @@ module internal Main =
             ReferencedProjects = [| |]
             IsIncompleteTypeCheckEnvironment = true
             UseScriptResolutionRules = false   
-            LoadTime = LanguageService.fakeDateTimeRepresentingTimeLoaded file
+            LoadTime = DateTime.Now //CompilerServiceInterface.fakeDateTimeRepresentingTimeLoaded file
             UnresolvedReferences = None },
           file,
           String.concat "\n" state.Files.[file].Lines)
       
     //Debug.print "main state is:\n %A\n%A"  (Map.toList state.Files)  (Map.toList state.Projects)
-    match parseCommand(Console.ReadLine()) with
+    match CommandInput.parseCommand(Console.ReadLine()) with
     | Parse(file,kind) ->
-        // Trigger parse request for a particular file
         let lines = readInput [] |> Array.ofList
         let file = Path.GetFullPath file
 
@@ -419,8 +137,10 @@ module internal Main =
                                                       { Lines = lines
                                                         Touched = DateTime.Now } }
         let options =
-          if LanguageService.IsAScript file then
-            RequestOptions(agent.GetScriptCheckerOptions(file, text),
+          if CompilerServiceInterface.isAScript file then
+            let rawOptions = checker.GetProjectOptionsFromScript(file, text) |> Async.RunSynchronously
+            let checkOptions = { rawOptions with OtherOptions = CompilerServiceInterface.ensureFSharpCore rawOptions.OtherOptions }
+            RequestOptions(checkOptions,
                            file,
                            text)
           else
@@ -428,18 +148,18 @@ module internal Main =
         
         let task =
           async {
-            let! results = agent.ParseAndCheckFileInProject(options)
-            match results.GetErrors() with
-            | None -> ()
-            | Some errs ->
-                prAsJson { Kind = "errors"
-                           Data = Seq.map FSharpErrorInfo.OfFSharpError errs }
+            let! _parseResults, checkResults = checker.ParseAndCheckFileInProject(options.FileName, 0, options.Source, options.Options)
+            match checkResults with
+            | FSharpCheckFileAnswer.Aborted -> ()
+            | FSharpCheckFileAnswer.Succeeded results ->
+                respond.WriteJson { Kind = "errors"
+                                    Data = Seq.map FSharpErrorInfo.OfFSharpError results.Errors }
           }
 
         match kind with
-        | Synchronous -> printMsg "info" "Synchronous parsing started"
+        | Synchronous -> respond.Info "Synchronous parsing started"
                          Async.RunSynchronously task
-        | Normal -> printMsg "info" "Background parsing started"
+        | Normal -> respond.Info "Background parsing started"
                     Async.StartImmediate task
 
         let state = { state with FileCheckOptions = state.FileCheckOptions
@@ -447,52 +167,53 @@ module internal Main =
         main state
 
     | Project file ->
-        // Load project file and store in state
         let file = Path.GetFullPath file
         if File.Exists file then
-          try
-            let p = SourceCodeServices.FSharpProjectFileInfo.Parse(file)
-            let files =
-              [ for f in p.CompileFiles do
-                  yield IO.Path.Combine(p.Directory, f) ]
-            // TODO: Handle these options more gracefully
-            let targetFilename = match p.OutputFile with Some p -> p | None -> "Unknown"
-            let framework = match p.FrameworkVersion with Some p -> p | None -> "Unknown"
-            let loadedTimeStamp = LanguageService.fakeDateTimeRepresentingTimeLoaded file
-            let projectOptions = agent.GetChecker().GetProjectOptionsFromCommandLineArgs(file, Array.ofList p.Options, loadedTimeStamp=loadedTimeStamp)
-            let referencedProjectOptions =
-              [| for file in p.ProjectReferences do
-                     if Path.GetExtension(file) = ".fsproj" then
-                         yield file, agent.GetChecker().GetProjectOptionsFromProjectFile(file, loadedTimeStamp=loadedTimeStamp) |]
-                   
-            prAsJson { Kind = "project"
-                       Data = { Project = file
-                                Files = files
-                                Output = targetFilename
-                                References = List.sortBy Path.GetFileName p.References
-                                Framework = framework } }
-            let po = { projectOptions
-                       with ReferencedProjects = referencedProjectOptions }
-            let projects =
-              files
-              |> List.fold (fun s f -> Map.add f po s) state.FileCheckOptions
-            main { state with FileCheckOptions = projects }
-          with e ->
-            printMsg "error" (sprintf "Project file '%s' is invalid: '%s'" file e.StackTrace)
-            main state
+          let state =
+            try
+              let p = SourceCodeServices.FSharpProjectFileInfo.Parse(file)
+              let files =
+                [ for f in p.CompileFiles do
+                    yield IO.Path.Combine(p.Directory, f) ]
+              // TODO: Handle these options more gracefully
+              let targetFilename = match p.OutputFile with Some p -> p | None -> "Unknown"
+              let framework = match p.FrameworkVersion with Some p -> p | None -> "Unknown"
+              let loadedTimeStamp = DateTime.Now //CompilerServiceInterface.fakeDateTimeRepresentingTimeLoaded file
+              let projectOptions = checker.GetProjectOptionsFromCommandLineArgs(file, Array.ofList p.Options, loadedTimeStamp=loadedTimeStamp)
+              let referencedProjectOptions =
+                [| for file in p.ProjectReferences do
+                       if Path.GetExtension(file) = ".fsproj" then
+                           let opts = checker.GetProjectOptionsFromProjectFile(file, loadedTimeStamp=loadedTimeStamp)
+                           yield file, opts |]
+
+              respond.WriteJson
+                  { Kind = "project"
+                    Data = { Project = file
+                             Files = files
+                             Output = targetFilename
+                             References = List.sortBy Path.GetFileName p.References
+                             Framework = framework } }
+              let po = { projectOptions
+                         with ReferencedProjects = referencedProjectOptions }
+              let projects =
+                files
+                |> List.fold (fun s f -> Map.add f po s) state.FileCheckOptions
+              { state with FileCheckOptions = projects }
+            with e ->
+              respond.Error (sprintf "Project file '%s' is invalid: '%s'" file e.Message)
+              state
+          main state
         else
-          printMsg "error" (sprintf "File '%s' does not exist" file)
+          respond.Error (sprintf "File '%s' does not exist" file)
           main state
 
     | Declarations file ->
         let file = Path.GetFullPath file
         if parsed file then
           let options = getRequestOptions file state
-          let parseResult =
-            agent.GetChecker().ParseFileInProject(options.FileName, options.Source, options.Options)
-            |> Async.RunSynchronously
-          let decls = parseResult.GetNavigationItems().Declarations
-          prAsJson { Kind = "declarations"; Data = decls }
+          let decls = CompilerServiceInterface.getDeclarations checker options
+          respond.WriteJson { Kind = "declarations"; Data = decls }
+
         main state
 
     | HelpText sym ->
@@ -503,7 +224,7 @@ module internal Main =
 
           let tip = TipFormatter.formatTip d
           let helptext = Map.add sym tip Map.empty
-          prAsJson { Kind = "helptext"; Data = helptext }
+          respond.WriteJson { Kind = "helptext"; Data = helptext }
 
         main state
 
@@ -512,20 +233,22 @@ module internal Main =
         if parsed file && posok file line col then
           let options = getRequestOptions file state
           let lineStr = state.Files.[file].Lines.[line - 1]
-          // TODO: Deny recent typecheck results under some circumstances (after bracketed expr..)
-          let timeout = match timeout with Some x -> x | _ -> 20000
-          let tyResOpt = agent.GetTypedParseResultWithTimeout(options,
-                                                              AllowStaleResults.MatchingFileName,
-                                                              timeout)
-                         |> Async.RunSynchronously
+          let tyResOpt = checker.TryGetRecentTypeCheckResultsForFile(options.FileName, options.Options)
           match tyResOpt with
-          | None -> printMsg "error" "Timeout when fetching typed parse result"; main state
-          | Some tyRes ->
+          | None -> respond.Error "Cached typecheck results not yet available"; main state
+          | Some (parseResults, tyRes, _version) ->
 
           match cmd with
           | Completion ->
-
-              match tyRes.GetDeclarations(line, col, lineStr) with
+              let longName,residue = Parsing.findLongIdentsAndResidue(col - 1, lineStr)
+              let results =
+                try
+                  let results =
+                    Async.RunSynchronously (tyRes.GetDeclarationListInfo(Some parseResults, line, col, lineStr, longName, residue, fun (_,_) -> false),
+                                            ?timeout = timeout)
+                  Some (results, residue)
+                with :? TimeoutException -> None
+              match results with
               | Some (decls, residue) ->
                   let decls =
                     match filter with
@@ -538,45 +261,54 @@ module internal Main =
                   | None -> ()
                   | Some d -> let tip = TipFormatter.formatTip d.DescriptionText
                               let helptext = Map.add d.Name tip Map.empty
-                              prAsJson { Kind = "helptext"; Data = helptext }
+                              respond.WriteJson { Kind = "helptext"; Data = helptext }
 
-                  prAsJson { Kind = "completion"
-                             Data = [ for d in decls do
-                                        let (glyph, glyphChar) = CompletionUtils.getIcon d.Glyph
-                                        yield { Name = d.Name; Glyph = glyph; GlyphChar = glyphChar } ] }
+                  respond.WriteJson
+                      { Kind = "completion"
+                        Data = [ for d in decls do
+                                   let (glyph, glyphChar) = CompletionUtils.getIcon d.Glyph
+                                   yield { Name = d.Name; Glyph = glyph; GlyphChar = glyphChar } ] }
 
                   let helptext =
                     Seq.fold (fun m (d: FSharpDeclarationListItem) -> Map.add d.Name d.DescriptionText m) Map.empty decls
 
                   main { state with HelpText = helptext }
               | None ->
-                  printMsg "error" "Could not get type information"
+                  respond.Error "Could not get type information"
                   main state
 
           | ToolTip ->
 
-              let tipopt = tyRes.GetToolTip(line, col, lineStr)
-                           |> Async.RunSynchronously
+              match Parsing.findLongIdents(col - 1, lineStr) with 
+              | None -> respond.Info "Cannot find indent for tooltip"
+              | Some(col,identIsland) ->
 
-              match tipopt with
-              | None -> printMsg "info" "No tooltip information"
-              | Some (tip,_) ->
+                // TODO: Display other tooltip types, for example for strings or comments where appropriate
+                let tip = tyRes.GetToolTipTextAlternate(line, col + 1, lineStr, identIsland, Parser.tagOfToken(Parser.token.IDENT("")))
+                          |> Async.RunSynchronously
                 match tip with
                 | FSharpToolTipText(elems) when elems |> List.forall (function
                   FSharpToolTipElement.None -> true | _ -> false) ->
-                  printMsg "info" "No tooltip information"
-                | _ -> prAsJson { Kind = "tooltip"; Data = TipFormatter.formatTip tip }
+                  respond.Info "No tooltip information"
+                | _ -> respond.WriteJson { Kind = "tooltip"; Data = TipFormatter.formatTip tip }
 
               main state
 
           | SymbolUse ->
               let symboluses =
                   async {
-                      let! symboluse = tyRes.GetSymbol(line, col, lineStr)
-                      if symboluse.IsNone then return None else
-                      let! symboluses = tyRes.GetUsesOfSymbolInFile symboluse.Value.Symbol
+                      match Parsing.findLongIdents(col - 1, lineStr) with 
+                      | None -> return None
+                      | Some(colu, identIsland) ->
+
+                      let! symboluse = tyRes.GetSymbolUseAtLocation(line, colu + 1, lineStr, identIsland)
+                      match symboluse with
+                      | None -> return None
+                      | Some symboluse ->
+
+                      let! symboluses = tyRes.GetUsesOfSymbolInFile symboluse.Symbol
                       return Some {
-                        Name = symboluse.Value.Symbol.DisplayName
+                        Name = symboluse.Symbol.DisplayName
                         Uses =
                           [ for su in symboluses do
                               yield { StartLine = su.RangeAlternate.StartLine
@@ -593,20 +325,24 @@ module internal Main =
                   |> Async.RunSynchronously
 
               match symboluses with
-              | Some su -> prAsJson { Kind = "symboluse"; Data = su }
-              | _ -> printMsg "error" "No symbols found"
+              | Some su -> respond.WriteJson { Kind = "symboluse"; Data = su }
+              | _ -> respond.Error "No symbols found"
 
               main state
 
           | FindDeclaration ->
-            let declarations = tyRes.GetDeclarationLocation(line,col,lineStr)
-                               |> Async.RunSynchronously
-            match declarations with
-            | FSharpFindDeclResult.DeclNotFound _ -> printMsg "error" "Could not find declaration"
-            | FSharpFindDeclResult.DeclFound range ->
+            match Parsing.findLongIdents(col - 1, lineStr) with 
+            | None -> respond.Info "Could not find ident at this location"
+            | Some(col,identIsland) -> 
 
-                  let data = { Line = range.StartLine; Column = range.StartColumn + 1; File = range.FileName }
-                  prAsJson { Kind = "finddecl"; Data = data }
+              let declarations = tyRes.GetDeclarationLocationAlternate(line, col + 1, lineStr, identIsland, false)
+                                 |> Async.RunSynchronously
+              match declarations with
+              | FSharpFindDeclResult.DeclNotFound _ -> respond.Error "Could not find declaration"
+              | FSharpFindDeclResult.DeclFound range ->
+
+                    let data = { Line = range.StartLine; Column = range.StartColumn + 1; File = range.FileName }
+                    respond.WriteJson { Kind = "finddecl"; Data = data }
 
             main state
 
@@ -637,34 +373,36 @@ module internal Main =
               | _, 1, 1 -> 0, line, col
               | newPos -> newPos
 
-            let meth = tyRes.GetMethods(line, col, state.Files.[file].Lines.[line - 1])
-                       |> Async.RunSynchronously
-            match meth with
-            | Some (name,overloads) when overloads.Length > 0 ->
-                  prAsJson
-                   { Kind = "method"
-                     Data = { Name = name
-                              CurrentParameter = commas
-                              Overloads =
-                               [ for o in overloads do
-                                  let tip = TipFormatter.formatTip o.Description
-                                  yield {
-                                    Tip = tip
-                                    TypeText = o.TypeText
-                                    Parameters =
-                                      [ for p in o.Parameters do
-                                         yield {
-                                           Name = p.ParameterName
-                                           CanonicalTypeTextForSorting = p.CanonicalTypeTextForSorting
-                                           Display = p.Display
-                                           Description = p.Description
-                                         }
-                                    ]
-                                    IsStaticArguments = o.IsStaticArguments
-                                  }
+            let lineStr = state.Files.[file].Lines.[line - 1]
+            match Parsing.findLongIdentsAtGetMethodsTrigger(col - 1, lineStr) with 
+            | None -> respond.Info "Could not find ident at this location"
+            | Some identIsland ->
 
-                               ] } }
-            | _ -> printMsg "error" "Could not find method"
+              let meth = tyRes.GetMethodsAlternate(line, col, lineStr, Some identIsland)
+                         |> Async.RunSynchronously
+              respond.WriteJson
+               { Kind = "method"
+                 Data = { Name = meth.MethodName
+                          CurrentParameter = commas
+                          Overloads =
+                           [ for o in meth.Methods do
+                              let tip = TipFormatter.formatTip o.Description
+                              yield {
+                                Tip = tip
+                                TypeText = o.TypeText
+                                Parameters =
+                                  [ for p in o.Parameters do
+                                     yield {
+                                       Name = p.ParameterName
+                                       CanonicalTypeTextForSorting = p.CanonicalTypeTextForSorting
+                                       Display = p.Display
+                                       Description = p.Description
+                                     }
+                                ]
+                                IsStaticArguments = o.IsStaticArguments
+                              }
+
+                           ] } }
 
             main state
 
@@ -674,17 +412,17 @@ module internal Main =
     | CompilerLocation ->
         let locopt = FSharpEnvironment.BinFolderOfDefaultFSharpCompiler None
         match locopt with
-        | None -> printMsg "error" "Could not find compiler"
-        | Some loc -> prAsJson { Kind = "compilerlocation"; Data = loc }
+        | None -> respond.Error "Could not find compiler"
+        | Some loc -> respond.WriteJson { Kind = "compilerlocation"; Data = loc }
 
         main state
 
     | Error(msg) ->
-        printMsg "error" msg
+        respond.Error msg
         main state
 
     | Quit ->
-        printAgent.Quit()
+        respond.Quit()
         (!Debug.output).Close ()
         0
 
@@ -699,6 +437,6 @@ module internal Main =
       1
     else
       try
-        main initialState
+        main State.Initial
       finally
         (!Debug.output).Close ()

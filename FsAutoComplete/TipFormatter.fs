@@ -1,7 +1,7 @@
 ﻿// --------------------------------------------------------------------------------------
 // (c) Tomas Petricek, http://tomasp.net/blog
 // --------------------------------------------------------------------------------------
-module internal FSharp.InteractiveAutocomplete.TipFormatter
+module internal FsAutoComplete.TipFormatter
 
 open System.Text
 open Microsoft.FSharp.Compiler.SourceCodeServices
