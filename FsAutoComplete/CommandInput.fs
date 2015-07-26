@@ -3,31 +3,30 @@ namespace FsAutoComplete
 open Parser
 open System
 
+// The types of commands that need position information
+type PosCommand =
+  | Completion
+  | Methods
+  | SymbolUse
+  | ToolTip
+  | FindDeclaration
+
+type ParseKind =
+  | Normal
+  | Synchronous
+
+// Command that can be entered on the command-line
+type Command =
+  | PosCommand of PosCommand * string * int * int * int option * string option
+  | HelpText of string
+  | Declarations of string
+  | Parse of string * ParseKind
+  | Error of string
+  | Project of string
+  | CompilerLocation
+  | Quit
+
 module CommandInput =
-
-  // The types of commands that need position information
-  type PosCommand =
-    | Completion
-    | Methods
-    | SymbolUse
-    | ToolTip
-    | FindDeclaration
-
-  type ParseKind =
-    | Normal
-    | Synchronous
-
-  // Command that can be entered on the command-line
-  type Command =
-    | PosCommand of PosCommand * string * int * int * int option * string option
-    | HelpText of string
-    | Declarations of string
-    | Parse of string * ParseKind
-    | Error of string
-    | Project of string
-    | CompilerLocation
-    | Quit
-
   /// Parse 'quit' command
   let quit = string "quit" |> Parser.map (fun _ -> Quit)
 
