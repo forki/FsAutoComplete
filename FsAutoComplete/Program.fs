@@ -70,9 +70,7 @@ type internal State =
 
 module internal Main =
   let respond = new CommandResponse.ResponseAgent()
-
-  let checker = FSharpChecker.Instance
-  do checker.BeforeBackgroundFileCheck.Add (fun _ -> ())
+  let checker = new FSharpCompilerServiceChecker()
 
   let mutable currentFiles = Map.empty
   let originalFs = AbstractIL.Internal.Library.Shim.FileSystem
@@ -103,10 +101,8 @@ module internal Main =
 
         let text = String.concat "\n" lines
 
-        if CompilerServiceInterface.isAScript file then
-          let rawOptions = checker.GetProjectOptionsFromScript(file, text)
-                           |> Async.RunSynchronously
-          let checkOptions = { rawOptions with OtherOptions = CompilerServiceInterface.ensureFSharpCore rawOptions.OtherOptions }
+        if Utils.isAScript file then
+          let checkOptions = checker.GetProjectOptionsFromScript(file, text)
           let state = state.WithFileTextAndCheckerOptions(file, lines, checkOptions)
           parse file text checkOptions
           main state
@@ -117,7 +113,7 @@ module internal Main =
 
     | Project file ->
         let file = Path.GetFullPath file
-        match CompilerServiceInterface.tryGetProjectOptions checker file with
+        match checker.TryGetProjectOptions(file) with
         | Result.Failure s ->
             respond.Error(s)
             main state
@@ -135,7 +131,7 @@ module internal Main =
         match state.TryGetFileCheckerOptionsWithSource(file) with
         | Failure s -> respond.Error(s)
         | Success (checkOptions, source) ->
-            let decls = CompilerServiceInterface.getDeclarations checker file source checkOptions
+            let decls = checker.GetDeclarations(file, source, checkOptions)
             respond.Declarations(decls)
 
         main state
@@ -158,11 +154,11 @@ module internal Main =
           let tyResOpt = checker.TryGetRecentTypeCheckResultsForFile(file, options)
           match tyResOpt with
           | None -> respond.Error "Cached typecheck results not yet available"; main state
-          | Some (parseResults, tyRes, _version) ->
+          | Some tyRes ->
 
           match cmd with
           | Completion ->
-              match CompilerServiceInterface.tryGetCompletions parseResults tyRes line col lineStr timeout filter with
+              match tyRes.TryGetCompletions line col lineStr timeout filter with
               | Some (decls, residue) ->
                   let declName (d: FSharpDeclarationListItem) = d.Name
 
@@ -188,7 +184,7 @@ module internal Main =
           | ToolTip ->
               // A failure is only info here, as this command is expected to be
               // used 'on idle', and frequent errors are expected.
-              match CompilerServiceInterface.tryGetToolTip tyRes line col lineStr with
+              match tyRes.TryGetToolTip line col lineStr with
               | Result.Failure s -> respond.Info(s)
               | Result.Success tip -> respond.ToolTip(tip)
   
@@ -197,21 +193,21 @@ module internal Main =
           | SymbolUse ->
               // A failure is only info here, as this command is expected to be
               // used 'on idle', and frequent errors are expected.
-              match CompilerServiceInterface.tryGetSymbolUse tyRes line col lineStr with
+              match tyRes.TryGetSymbolUse line col lineStr with
               | Result.Failure s -> respond.Info(s)
               | Result.Success su -> respond.SymbolUse(su)
 
               main state
 
           | FindDeclaration ->
-              match CompilerServiceInterface.tryFindDeclaration tyRes line col lineStr with
+              match tyRes.TryFindDeclaration line col lineStr with
               | Result.Failure s -> respond.Error s
               | Result.Success range -> respond.FindDeclaration(range)
 
               main state
 
           | Methods ->
-              match CompilerServiceInterface.tryGetMethodOverrides tyRes lines line col with
+              match tyRes.TryGetMethodOverrides lines line col with
               | Result.Failure s -> respond.Error s
               | Result.Success (meth, commas) -> respond.Method(meth, commas)
 
