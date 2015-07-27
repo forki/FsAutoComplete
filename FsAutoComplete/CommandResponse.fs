@@ -76,12 +76,6 @@ module CommandResponse =
       Framework: string
     }
 
-  type ToolTipElement =
-    {
-      Text: string
-      XmlDoc: Option<string>
-    }
-
   type OverloadParameter =
     {
       Name : string
@@ -292,28 +286,6 @@ module CommandResponse =
 
     member x.Declarations(decls) =
       x.WriteJson { Kind = "declarations"; Data = decls }
-
-    member x.ToolTipSymbol(FSharpToolTipText elements) =
-      let xmldoc cmt =
-        match cmt with
-        | FSharpXmlDoc.Text s -> Some s
-        | FSharpXmlDoc.None -> None
-        | FSharpXmlDoc.XmlDocFileSignature(file, key) -> Some (file + "," + key)
-
-      let data =
-        [ for e in elements do
-            match e with
-            | FSharpToolTipElement.None -> ()
-            | FSharpToolTipElement.CompositionError err ->
-                yield [ {Text = err; XmlDoc = None} ]
-            | FSharpToolTipElement.Single(it, comment) ->
-                yield [{ Text = it; XmlDoc = xmldoc comment }]
-            | FSharpToolTipElement.Group(items) ->
-                yield [ for it, comment in items do
-                          yield { Text = it; XmlDoc = xmldoc comment } ]
-          ]
-      
-      x.WriteJson { Kind = "tooltip"; Data = data }
 
     member x.ToolTip(tip) =
       x.WriteJson { Kind = "tooltip"; Data = TipFormatter.formatTip tip }
