@@ -33,3 +33,11 @@ let ``normalCracking`` () =
   Assert.AreEqual(11,col)
   Assert.AreEqual(["First";"Second"],idents)
   Assert.AreEqual("First.Second.Third".[col], 'd')
+
+[<Test>]
+let ``should find FSharp Core`` () =
+  match CompilerServiceInterface.newestFSharpCoreLocation with
+  | None -> Assert.Fail()
+  | Some (fullName: string) ->
+      if not (fullName.ToLower().Contains("gac")) then
+        Assert.Fail(sprintf "Did not return FSharp.Core from the GAC: '%s'" fullName)
