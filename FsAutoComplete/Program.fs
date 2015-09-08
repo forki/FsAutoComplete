@@ -262,6 +262,7 @@ module internal Main =
 
   [<EntryPoint>]
   let entry args =
+    printfn "%A" System.Console.InputEncoding
     let extra = Options.p.Parse args
     if extra.Count <> 0 then
       printfn "Unrecognised arguments: %s" (String.concat "," extra)
