@@ -8,5 +8,12 @@
 }
 {
   "Kind": "tooltip",
-  "Data": "val ΣΣΣΣ : int\n\nFull name: Script.ΣΣΣΣ"
+  "Data": [
+    [
+      {
+        "Signature": "val ΣΣΣΣ : int\n\nFull name: Script.ΣΣΣΣ",
+        "Comment": ""
+      }
+    ]
+  ]
 }
