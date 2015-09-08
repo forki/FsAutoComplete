@@ -6,3 +6,7 @@
   "Kind": "errors",
   "Data": []
 }
+{
+  "Kind": "tooltip",
+  "Data": "val ΣΣΣΣ : int\n\nFull name: Script.ΣΣΣΣ"
+}

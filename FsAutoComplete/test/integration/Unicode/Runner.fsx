@@ -9,6 +9,7 @@ File.Delete "output.json"
 let p = new FsAutoCompleteWrapper()
 
 p.parse "Script.fsx"
+p.tooltip "Script.fsx" 2 5
 p.send "quit\n"
 p.finalOutput ()
 |> writeNormalizedOutput "output.json"
