@@ -144,11 +144,28 @@ type FSharpCompilerServiceChecker() =
             ensureCorrectFSharpCore (Array.ofList p.Options), Option.toList Environment.fsharpCoreOpt @ p.References
           else
              Array.ofList p.Options, p.References
+        let args = Array.map (fun (s: string) -> s.Replace("//", "/")) args
 
         let projectOptions = checker.GetProjectOptionsFromCommandLineArgs(file, args)
+
+        let rec getOptions file : string * FSharpProjectOptions =
+          let p = FSharpProjectFileInfo.Parse(file)
+          let args =
+            if not (Seq.exists (fun (s: string) -> s.Contains "FSharp.Core.dll") p.Options) then
+              ensureCorrectFSharpCore (Array.ofList p.Options)
+            else
+               Array.ofList p.Options
+          let args = Array.map (fun (s: string) -> s.Replace("//", "/")) args
+          let projectOptions = checker.GetProjectOptionsFromCommandLineArgs(file, args)
+          let referencedProjectOptions =
+            [| for file in p.ProjectReferences do
+                 let out, opts = getOptions (Path.GetFullPath file)
+                 yield out, opts |]
+          p.OutputFile.Value, {projectOptions with ReferencedProjects = referencedProjectOptions}
+
         let referencedProjectOptions =
           [| for file in p.ProjectReferences do
-               yield file, checker.GetProjectOptionsFromProjectFile(file) |]
+               yield getOptions file |]
 
         let po =
           { projectOptions
